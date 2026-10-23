@@ -1,0 +1,11 @@
+[versions]
+lettuce = "6.5.5.RELEASE"
+junit = "5.11.4"
+testcontainers = "1.20.6"
+
+[libraries]
+lettuce-core = { module = "io.lettuce:lettuce-core", version.ref = "lettuce" }
+junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
+junit-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
