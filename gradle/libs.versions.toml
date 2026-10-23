@@ -1,7 +1,7 @@
 [versions]
 lettuce = "6.5.5.RELEASE"
 junit = "5.11.4"
-testcontainers = "1.20.6"
+testcontainers = "1.21.4"
 
 [libraries]
 lettuce-core = { module = "io.lettuce:lettuce-core", version.ref = "lettuce" }

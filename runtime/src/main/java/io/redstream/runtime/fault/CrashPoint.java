@@ -1,13 +1,16 @@
 package io.redstream.runtime.fault;
 
-/** Places in the task loop where a crash is interesting for exactly-once testing. */
+/**
+ * Places in a task where a crash is interesting for exactly-once testing. Call
+ * {@link FaultHooks#at} at each one from {@code StreamTask}; add more as the plan grows.
+ */
 public enum CrashPoint {
-    /** Records read and partly processed; nothing committed. */
+    /** Records read and partly processed. */
     AFTER_READ,
-    /** Batch fully processed in memory; commit not sent. */
-    BEFORE_COMMIT,
-    /** Commit applied; outbox not forwarded yet. */
-    AFTER_COMMIT,
-    /** Outbox entries appended downstream; forwarding progress not acked (duplicates follow). */
-    BEFORE_FORWARD_ACK
+    /** State snapshotted for a checkpoint; acknowledgement not sent (plan step 4). */
+    BEFORE_ACK,
+    /** Acknowledgement sent; checkpoint may not be complete yet (plan step 4). */
+    AFTER_ACK,
+    /** Checkpoint complete; sink transaction not committed yet (plan step 7). */
+    BEFORE_SINK_COMMIT
 }

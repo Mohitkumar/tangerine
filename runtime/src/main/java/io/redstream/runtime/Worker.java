@@ -27,7 +27,7 @@ import java.util.concurrent.TimeoutException;
  * One engine process. Every worker runs the same job definition (library-style, like Kafka
  * Streams), plans it identically, and coordinates only through Redis: it heartbeats, works out
  * which partitions it should own, and acquires or releases their leases. Each owned partition
- * runs as a {@link PartitionTask} on a virtual thread.
+ * runs as a {@link StreamTask} on a virtual thread.
  */
 public final class Worker implements AutoCloseable {
 
@@ -46,7 +46,7 @@ public final class Worker implements AutoCloseable {
     private final ScheduledExecutorService control = Executors.newSingleThreadScheduledExecutor(
             Thread.ofPlatform().name("redstream-control").daemon().factory());
 
-    private record Running(PartitionTask task, Future<?> future, long epoch) {}
+    private record Running(StreamTask task, Future<?> future, long epoch) {}
 
     private Worker(JobDefinition job, WorkerConfig config, RedisOps ops, FaultHooks hooks) {
         this.graph = LogicalPlanner.plan(job);
@@ -119,7 +119,7 @@ public final class Worker implements AutoCloseable {
     }
 
     private void startTask(PartitionId pid, long epoch) {
-        var task = new PartitionTask(graph, graph.stage(pid.stage()), pid.partition(), epoch, ops, keySpace, config, hooks);
+        var task = new StreamTask(graph, graph.stage(pid.stage()), pid.partition(), epoch, ops, keySpace, config, hooks);
         running.put(pid, new Running(task, tasks.submit(task), epoch));
     }
 

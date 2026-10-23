@@ -2,17 +2,15 @@ package io.redstream.redis;
 
 /**
  * Keys for one partition (a source partition or a key group). They share one hash tag, so in
- * Redis Cluster they live in the same slot and a single Lua script can update all of them
- * atomically. This colocation is what the whole commit protocol rests on.
+ * Redis Cluster they live in the same slot and a single Lua script can update them together.
  *
  * <pre>
- *   {job:s1:p42}:meta    HASH   epoch, in_offset, out_seq, fwd_offset, wm, seen:&lt;producer&gt;
+ *   {job:s1:p42}:meta    HASH   epoch (owner fencing)
  *   {job:s1:p42}:in      STREAM shuffled input (keyed stages only)
- *   {job:s1:p42}:state   HASH   keyed state
- *   {job:s1:p42}:out     STREAM outbox, drained by the forwarder
- *   {job:s1:p42}:timers  ZSET   event-time timers (milestone 4)
  *   {job:s1:p42}:lease   STRING owning worker id, with TTL
  * </pre>
+ *
+ * Plan step 5 moves keyed input to one stream per restart attempt, {@code :in:a<attempt>}.
  */
 public record PartitionKeys(String job, int stage, int partition) {
 
@@ -28,23 +26,11 @@ public record PartitionKeys(String job, int stage, int partition) {
         return tag() + ":in";
     }
 
-    public String state() {
-        return tag() + ":state";
-    }
-
-    public String out() {
-        return tag() + ":out";
-    }
-
-    public String timers() {
-        return tag() + ":timers";
-    }
-
     public String lease() {
         return tag() + ":lease";
     }
 
-    /** Stable id stamped on everything this partition emits; used for downstream dedup. */
+    /** Stable id stamped on everything this partition emits; keyed tasks use it to align barriers. */
     public String producerId() {
         return "s" + stage + "p" + partition;
     }

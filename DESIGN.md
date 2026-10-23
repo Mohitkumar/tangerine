@@ -1,8 +1,9 @@
 # Redstream design
 
-Redstream is a Flink-style stream processing engine that uses Redis as its log, its state
-store and its coordination service. This document describes how it works, why it is built
-this way, and where its guarantees end.
+Redstream is a stream processing engine that works like Flink and uses Redis for everything
+around it: Redis Streams carry the data, Redis holds the checkpoints, and workers coordinate
+through Redis. This document describes the design. [PLAN.md](PLAN.md) is the order to build
+it in.
 
 Contents
 
@@ -10,18 +11,16 @@ Contents
 2. The core idea
 3. Deployment model
 4. From DataStream API to stages
-5. Redis data layout
-6. The commit protocol
-7. The keyBy shuffle
-8. Ownership: leases, epochs, fencing
+5. State backends
+6. Checkpoints
+7. Barriers and alignment
+8. Leadership, ownership and fencing
 9. Recovery
-10. Time, watermarks and windows (planned)
-11. Backpressure
-12. Sinks and end-to-end guarantees
-13. Failure model and limits
-14. Comparison with Flink
-15. Milestones
-16. Open questions
+10. Sinks and end-to-end guarantees
+11. Redis data layout
+12. Failure model and limits
+13. Comparison with Flink
+14. Open questions
 
 ---
 
@@ -29,75 +28,68 @@ Contents
 
 Goals:
 
-- **Exactly-once state updates** for keyed processing: after any crash, every input record's
-  effect on state and on emitted output happens once.
-- **A DataStream API that feels like Flink's**: `map`, `flatMap`, `filter`, `keyBy`,
-  keyed process functions with `ValueState`, event-time windows.
-- **Nothing to operate except Redis**: no JobManager, no ZooKeeper, no external checkpoint store.
-- **Recovery that is local and fast**: a failed partition restores itself, the rest of the job keeps running.
-- **Small enough to read**: the fault-tolerance core is two Lua scripts and one Java class.
+- **Flink's model, small enough to read**: operator chains, keyed state backends, checkpoint
+  barriers, a checkpoint coordinator and global recovery, each in a few classes.
+- **A DataStream API that feels like Flink's**: `map`, `flatMap`, `filter`, `keyBy`, keyed
+  process functions with `ValueState`.
+- **Exactly-once state**, and exactly-once output through a two-phase-commit sink.
+- **Nothing to operate except Redis**: no JobManager process, no ZooKeeper, no S3.
+- **Pluggable state backends**: state on the heap or in RocksDB, as in Flink.
 
 Non-goals (for now):
 
-- State larger than memory. Redis is the state store, so state must fit in RAM across the cluster.
-- Durability stronger than the Redis deployment's (see section 13).
 - Joins, unions and multi-input operators. The planner supports linear pipelines with fan-out.
 - Changing the number of key groups of a running job.
+- Checkpoint storage outside Redis (the interface allows it later).
 
 ## 2. The core idea
 
-Flink gets exactly-once from **global consistent snapshots**: barriers flow through the job,
-each operator snapshots its state when the barrier passes, and a checkpoint is complete when
-every operator has acknowledged. Recovery rolls the *whole job* back to the last checkpoint.
+Flink gets exactly-once from **global consistent snapshots**. The coordinator asks the sources
+to start checkpoint `n`. Sources write a **barrier** into their output. Each task snapshots its
+state when barrier `n` has arrived on all of its inputs, then passes the barrier on. Checkpoint
+`n` is complete when every task has acknowledged. After a failure the whole job rolls back to
+the last completed checkpoint and the sources replay from there.
 
-Redis offers something Flink's runtime doesn't have: **server-side scripts that update several
-keys atomically**, provided the keys live in the same hash slot. Redstream builds on that:
+Redstream follows that model and maps each part onto Redis:
 
-> Put everything belonging to one partition (its input offset, its keyed state, its pending
-> outputs) under one hash tag. Then a single Lua call can commit a processed batch atomically:
-> state changes, outputs and the new input offset all land together, or none do.
-
-That turns exactly-once into a **per-partition, per-batch** transaction, closer to Kafka
-Streams' transactional model than to Flink's. There are no barriers and no global checkpoint.
-The one place atomicity cannot reach is across partitions (the shuffle), which is handled with
-idempotent delivery and sequence-number dedup (section 7).
+| Flink part | In Redstream |
+| --- | --- |
+| Network channels between tasks | Redis Streams, one per source partition and per key group |
+| JobManager | Whichever worker holds the leader lease |
+| RPC between JobManager and tasks | Keys in Redis that both sides read and write (`JobControl`) |
+| Checkpoint storage (S3, HDFS) | Redis keys (`CheckpointStorage`) |
+| State backend | Heap or RocksDB, local to the worker |
 
 ## 3. Deployment model
 
-Redstream runs **library-style, like Kafka Streams**:
+Redstream runs **library-style**, like Kafka Streams:
 
 - Every worker process runs the same `main()`, which builds the same `JobDefinition`.
 - Every worker plans it into the identical `JobGraph`. Planning is deterministic, so nothing
   about the job (operators, closures, serdes) is ever serialized or shipped.
-- Workers coordinate only through Redis: they heartbeat into a ZSET, compute the same
-  partition assignment from the live-worker list, and take ownership through leases.
+- Workers heartbeat into a ZSET, compute the same partition assignment from the live-worker
+  list, and take ownership of partitions through leases.
+- One worker also holds the **leader** lease and runs the checkpoint coordinator.
 
-To scale out, start another worker with the same code. To scale in, stop one: its leases are
-released (or expire) and other workers take its partitions.
+To scale out, start another worker with the same code. To scale in, stop one.
 
-One consequence for the API: a worker runs many partitions in one JVM, and functions are not
-copied per partition the way Flink copies them by deserialization. So:
-
-- Stateless functions (`map`, `flatMap`, `filter`, key selectors) are shared and must be
-  stateless and thread-safe.
-- Keyed functions keep state handles in fields, so `KeyedStream.process` takes a
-  `Supplier` (`CountWords::new`) and calls it once per partition, exactly like Kafka Streams'
-  `ProcessorSupplier`. The runtime rejects a supplier that returns the same instance twice.
-  (This was a real bug during development: one shared instance made every key group on a
-  worker write through the last-opened partition's state handle.)
+A worker runs many partitions in one JVM, and functions are not copied per partition the way
+Flink copies them by deserialization. So stateless functions (`map`, `flatMap`, `filter`, key
+selectors) must be thread-safe, and `KeyedStream.process` takes a `Supplier` that is called
+once per partition.
 
 ```mermaid
 flowchart LR
-  subgraph W1[Worker a]
+  subgraph W1[Worker a, leader]
+    C[checkpoint coordinator]
     T1[task s0p0]
     T2[task s1p3]
-    T3[task s1p9]
   end
   subgraph W2[Worker b]
     T4[task s0p1]
     T5[task s1p4]
   end
-  R[(Redis: streams, state, leases)]
+  R[(Redis: streams, checkpoints, leases)]
   W1 <--> R
   W2 <--> R
 ```
@@ -112,30 +104,28 @@ transformation types mirror Flink's:
 | Transformation | Created by | Notes |
 |---|---|---|
 | `SourceTransformation` | `env.fromSource(...)` | One source partition per Redis stream |
-| `OneInputTransformation` | `map`, `flatMap`, `filter`, `process`, `window().reduce()` | Carries an `OperatorSpec` and the output `Serde` |
+| `OneInputTransformation` | `map`, `flatMap`, `filter`, `process` | Carries an `OperatorSpec` and the output `Serde` |
 | `PartitionTransformation` | `keyBy` | Not an operator: marks a hash-partitioned edge |
-| `SinkTransformation` | `sinkTo(...)` | Appends to a Redis stream |
+| `SinkTransformation` | `sinkTo(...)` | Writes to a Redis stream |
 
-Every type-changing call takes an explicit `Serde`. Java erases generics, so at runtime the
-engine cannot tell what a `DataStream<Event>` holds; Flink solves the same problem with
-`TypeInformation`. Explicit serdes are simpler and make the wire format obvious.
+Every type-changing call takes an explicit `Serde`, because Java erases generics. Flink solves
+the same problem with `TypeInformation`.
 
 ### 4.2 Planning and chaining
 
-`LogicalPlanner` walks transformations in id order (a topological order, since inputs are
-always created first) and groups them into **stages**:
+`LogicalPlanner` groups transformations into **stages**:
 
 - A source starts a stage.
-- A `PartitionTransformation` (keyBy) starts a new stage and adds a shuffle output to the upstream stage.
+- A `keyBy` starts a new stage and adds a shuffle output to the upstream stage.
 - Any other operator joins its input's stage (operator chaining).
-- Every stage must end in a sink or a keyBy, otherwise its results would be discarded.
+- Every stage must end in a sink or a keyBy.
 
-Inside a stage, records pass between operators by **direct method call**: no serialization,
-no queue. This is the same as Flink's operator chaining and is where most per-record cost is saved.
+Inside a stage, records pass between operators by **direct method call**: no serialization, no
+queue. This is Flink's operator chaining.
 
 ```
 env.fromSource(lines)            ─┐
-   .flatMap(split)                │ stage 0 (source partitions = number of source streams)
+   .flatMap(split)                │ stage 0 (partitions = number of source streams)
    .keyBy(word)                  ─┘   → shuffle through Redis
    .process(CountWords::new)     ─┐
    .sinkTo(counts)               ─┘ stage 1 (partitions = key groups)
@@ -148,260 +138,184 @@ env.fromSource(lines)            ─┐
 | Source stage | One per source stream | The user's Redis stream |
 | Keyed stage | `maxParallelism` key groups (default 128) | One input stream per key group |
 
-A record's key group is `murmur3(serializedKey) mod maxParallelism`. Hashing the *serialized*
-key (not `hashCode()`) keeps the mapping identical across JVMs and runs.
+A record's key group is `murmur3(serializedKey) mod maxParallelism`. Hashing the serialized key
+keeps the mapping identical across JVMs and runs.
 
-The key group is the **unit of everything** in a keyed stage: input stream, state, commit,
-lease and ownership. Workers own sets of key groups. Rescaling moves whole key groups and never
-splits one, the same idea as Flink's key groups or Kafka's fixed partition count.
-`maxParallelism` therefore caps how many workers a keyed stage can use and cannot change
-without a state migration.
+The key group is the **unit of state, ownership and snapshots**. Rescaling moves whole key
+groups and never splits one, the same idea as Flink's key groups. `maxParallelism` caps how
+many workers a keyed stage can use.
 
-## 5. Redis data layout
+## 5. State backends
 
-All keys of one partition share a hash tag `{job:s<stage>:p<partition>}`, so in Redis Cluster
-they live in one slot and one Lua script can touch all of them.
+Keyed state lives in a `KeyedStateBackend`, one per key group, created by a `StateBackend`:
 
-| Key | Type | Contents |
-|---|---|---|
-| `{job:sS:pP}:meta` | HASH | `epoch`, `in_offset`, `out_seq`, `fwd_offset`, `wm`, `seen:<producer>` |
-| `{job:sS:pP}:in` | STREAM | Shuffled input (keyed stages only) |
-| `{job:sS:pP}:state` | HASH | Keyed state: field = `[operator id][state name][key]` |
-| `{job:sS:pP}:out` | STREAM | Outbox: committed outputs waiting to be forwarded |
-| `{job:sS:pP}:timers` | ZSET | Event-time timers (milestone 4) |
-| `{job:sS:pP}:lease` | STRING | Owning worker id, with TTL |
-| `{job}:workers` | ZSET | Live workers, score = last heartbeat (Redis server time) |
+| Backend | Where state lives | Snapshot | Good for |
+| --- | --- | --- | --- |
+| `HashMapStateBackend` | A Java map on the heap | Whole map serialized into one blob | Small state, learning |
+| `EmbeddedRocksDBStateBackend` | RocksDB on the worker's disk | SST files; incremental (only new files) | State larger than memory |
 
-Entries in an outbox, a shuffled input stream and a sink stream carry:
-`p` (producer id, e.g. `s0p1`), `s` (producer sequence number), `ts` (event time), `v` (payload).
-Outbox entries also carry `dst`, the destination stream.
+State is addressed by `[operator id][state name][key]` (`StateKeys`). Writes go straight into
+the backend: there is no per-batch buffer, because consistency comes from snapshots taken at
+barriers.
 
-`KeySpace` and `PartitionKeys` are the only classes that build key names. Job names are
-restricted to `[a-z0-9-]` because they go inside hash tags.
+A snapshot returns a `KeyedStateHandle`: the backend's name and the blob names it wrote. With
+incremental RocksDB checkpoints, SST files never change once written, so a blob can be shared
+by several checkpoints.
 
-## 6. The commit protocol
+## 6. Checkpoints
 
-### 6.1 Task loop
-
-Each owned partition runs a `PartitionTask` on a virtual thread:
+The **checkpoint coordinator** runs on the leader:
 
 ```mermaid
-sequenceDiagram
-  participant T as PartitionTask
-  participant R as Redis (one hash slot)
-  participant D as Downstream / sink stream
-  T->>R: restore: HGETALL meta, HGETALL state
-  loop while lease held
-    T->>R: XREAD outbox after fwd_offset
-    T->>D: XADD each entry to its dst
-    T->>R: forward_ack.lua (fenced): fwd_offset, XTRIM outbox
-    T->>R: XREAD input after in_offset (COUNT batchSize)
-    Note over T: dedup by (producer, seq); run operator chain;<br/>buffer state writes and outputs in memory
-    T->>R: commit.lua (fenced): state, outbox, in_offset, seen, wm
-  end
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> Pending: trigger (interval elapsed)
+  Pending --> Completed: every partition acknowledged
+  Pending --> Aborted: a decline, or timeout
+  Completed --> Idle
+  Aborted --> Idle
 ```
 
-### 6.2 `commit.lua`
+1. **Trigger:** pick the next id and publish it in `JobControl`. Ids keep increasing across
+   leaders.
+2. **Inject:** source tasks poll the requested id between batches. A source records its read
+   position, acknowledges, and writes barrier `n` into every downstream stream.
+3. **Align and snapshot:** keyed tasks align barriers (section 7), snapshot their state to
+   `CheckpointStorage`, and acknowledge with the state handle.
+4. **Complete:** when every partition of every stage has acknowledged, the coordinator commits
+   `CheckpointMetadata` (one `TaskSnapshot` per partition) and makes it the latest. Then it
+   tells tasks (`notifyCheckpointComplete`) and discards old checkpoints.
 
-One call per batch. Keys: `meta`, `state`, `out` (all in one slot). In order, it:
+At most one checkpoint is pending at a time. An aborted checkpoint never completes, and the job
+keeps running.
 
-1. Checks `meta.epoch == caller's epoch`; otherwise returns `FENCED` and writes nothing.
-2. Applies state writes (`HSET`) and deletes (`HDEL`).
-3. Appends each output to the outbox with the next value of `out_seq`.
-4. Records the highest sequence number seen from each upstream producer (`seen:<producer>`).
-5. Sets `in_offset`, `wm` and `out_seq`.
+## 7. Barriers and alignment
 
-Redis runs a script without interleaving other commands, so steps 1 to 5 are atomic. Lua
-errors after a write do not roll back in Redis, so the script validates (step 1) before it
-writes anything, and its remaining steps cannot fail on well-formed arguments.
+A barrier is a stream entry in the same stream as the data, with a kind field that marks it.
 
-### 6.3 Invariants
+A keyed task's single input stream mixes entries from every upstream partition (the `p` field
+names the producer). Once barrier `n` has arrived from producer A, A's later records belong to
+checkpoint `n + 1`. The task holds them back until barrier `n` has arrived from every producer,
+then snapshots, then processes what it held back. This is Flink's **aligned checkpoint**.
 
-For every partition, at all times:
+Every upstream partition sends every barrier to every downstream key group, even key groups it
+sent no data to. Otherwise a key group would wait for a barrier that never comes.
 
-- **I1.** `state` reflects exactly the input entries up to and including `in_offset`.
-- **I2.** The outbox contains every output produced by those entries, in order, numbered
-  `1..out_seq` without gaps (entries `<= fwd_offset` may have been trimmed after delivery).
-- **I3.** Every outbox entry up to `fwd_offset` has been appended to its destination at least once.
-- **I4.** Only the holder of the current epoch can change `meta`, `state` or `out`.
+## 8. Leadership, ownership and fencing
 
-I1 and I2 hold because they change only inside `commit.lua`. I3 holds because `fwd_offset`
-moves only after the XADDs. I4 is the fencing in both scripts.
+Two kinds of lease, both TTL keys in Redis with an epoch that increases on every new holder:
 
-### 6.4 Why there is no rollback path
+| Lease | Held by | Epoch fences |
+| --- | --- | --- |
+| Partition lease (`{job:sS:pP}:lease`) | The worker running that partition | Writes by a task that lost its partition |
+| Leader lease (`{job}:leader`) | The worker running the coordinator | Checkpoint requests, restarts and checkpoint commits by an old leader |
 
-Nothing reaches Redis except through `commit.lua`. A failure anywhere else (user code throwing,
-a crash, a lost connection) ends the task; the in-memory batch is discarded with it; the worker
-starts a fresh task that restores from Redis and re-reads from `in_offset`. Re-reading
-reprocesses exactly the records whose effects were never committed.
+A worker that stalls past its TTL (a long GC pause, a network partition) loses its lease, and
+the next holder bumps the epoch. When the stalled worker wakes up, its next fenced write fails
+with `FencedException` and it stops. TTL leases alone are not safe; the epoch check inside the
+same atomic script as the write is what makes them safe.
 
-## 7. The keyBy shuffle
-
-The outbox is in the producer's slot; the destination input stream is in another slot (and in
-Redis Cluster, often another node). They cannot be updated atomically, so the shuffle is made
-**idempotent** instead:
-
-1. The producer's commit puts outputs in its own outbox, numbered by `out_seq`. (atomic)
-2. The forwarder copies outbox entries to their destinations, preserving `(p, s)`. (not atomic)
-3. The forwarder acks progress with `forward_ack.lua`. (atomic, fenced)
-
-If a crash happens between 2 and 3, the next owner re-forwards the same entries with the same
-`(p, s)`. The consumer drops any entry with `s <= seen[p]`, and `seen[p]` is committed in the
-same transaction as the state it protects.
-
-This is correct because, for each (producer, destination) pair, sequence numbers arrive in
-increasing order: the outbox is ordered, and only the partition's current owner forwards it.
-During an ownership handover the old and new owners can both forward for a short time, but the
-new owner restarts from the acked `fwd_offset`, so anything it sends again is a prefix
-duplicate that the max-seen rule drops.
-
-Sequence numbers are assigned inside `commit.lua` and persisted in the outbox, so a replay
-reuses the original numbers. That is what makes the dedup sound; numbering at forward time
-would not be.
-
-## 8. Ownership: leases, epochs, fencing
-
-### 8.1 Membership and assignment
-
-Every `leaseTtl / 3` each worker runs one reconcile pass:
-
-1. `heartbeat.lua`: ZADD itself with Redis server time, evict entries older than the TTL,
-   return the live list. Server time avoids clock skew between workers.
-2. For each partition in a fixed global order, compute the preferred owner as
-   `liveWorkers[index mod n]`. Every worker computes the same answer.
-3. Preferred and not running: acquire the lease and start a task. Not preferred but running:
-   stop the task, then release the lease so the new owner does not wait for the TTL.
-
-Assignment is advice. **Leases are the source of truth**: during membership changes two
-workers may briefly disagree about who should own a partition, but only one can hold its lease.
-
-### 8.2 Epochs and fencing
-
-`lease.lua` bumps `meta.epoch` whenever a lease is newly acquired, and returns it. The task
-passes that epoch to every `commit.lua` and `forward_ack.lua` call.
-
-A worker that stalls past its TTL (a long GC pause, a network partition) loses the lease, and
-the next owner bumps the epoch. When the stalled worker wakes up, its next commit fails with
-`FENCED` and it stops. Without this check, the zombie's commit would overwrite the new owner's
-state: TTL leases alone are not safe. This is the standard fencing-token pattern.
-
-The epoch lives in the partition's own `meta` hash, so the check is in the same atomic script
-as the write it guards. A separate lock service could not give that guarantee.
+Task acknowledgements carry the **attempt** (section 9), so acks from tasks of an earlier
+attempt are ignored.
 
 ## 9. Recovery
 
-| Failure | What happens | Time to recover |
+Recovery is **global**, as in Flink:
+
+1. A task fails, or partition ownership changes (a worker joins or leaves).
+2. The leader starts a new **attempt** (`JobControl.requestRestart`).
+3. Every worker stops all its tasks.
+4. In-flight data from the old attempt is deleted: keyed input streams are named per attempt.
+5. Every task restores from the latest completed checkpoint: sources seek to their recorded
+   offsets, keyed tasks restore their state handles.
+6. Sources replay everything after the checkpoint.
+
+Ownership changes need a global restart because one partition restored on its own would be at
+a different point in time from the rest of the job.
+
+This is the main trade-off against a per-partition design: recovery is simple and always
+consistent, but one failure rewinds the whole job.
+
+## 10. Sinks and end-to-end guarantees
+
+| Sink | Guarantee | How |
+| --- | --- | --- |
+| Plain stream append | At-least-once | Records after the last checkpoint are written again after a restart |
+| Two-phase-commit sink | Exactly-once | Output is staged per checkpoint and made visible only when the checkpoint completes |
+
+The two-phase-commit sink follows Flink's `TwoPhaseCommitSinkFunction`: begin a transaction
+after each barrier, write into it, pre-commit at the next barrier (the transaction goes into
+the task's snapshot), commit on `notifyCheckpointComplete`. Commit must be idempotent, because
+a restored task commits again every transaction in its snapshot.
+
+Output then appears once per checkpoint interval rather than right away. That is the latency
+cost of exactly-once output, in Flink too.
+
+## 11. Redis data layout
+
+All keys of one partition share the hash tag `{job:sS:pP}`; all job-level keys share `{job}`.
+Keys in one tag live in one hash slot, so one Lua script can update them atomically.
+
+| Key | Type | Contents |
 |---|---|---|
-| Task throws (bug, bad record, Redis error) | Task ends; next reconcile restarts it from Redis, same epoch | ~`leaseTtl / 3` |
-| Worker process dies | Its leases expire; preferred owners acquire with new epochs | ~`leaseTtl` |
-| Worker stalls, then resumes | Fenced on its next write; stops its tasks | Immediate on resume |
-| Worker leaves gracefully | Tasks stop after their current batch; leases released | ~`leaseTtl / 3` |
+| `{job:sS:pP}:meta` | HASH | `epoch` (partition owner fencing) |
+| `{job:sS:pP}:lease` | STRING | Owning worker id, with TTL |
+| `{job:sS:pP}:in:a<attempt>` | STREAM | Keyed input for one attempt: records and barriers |
+| `{job}:workers` | ZSET | Live workers, score = last heartbeat (Redis server time) |
+| `{job}:leader` | STRING | Leader worker id, with TTL |
+| `{job}:control` | HASH | `leader_epoch`, `attempt`, requested checkpoint id and time |
+| `{job}:ckpt:<id>:acks` | HASH | Acknowledgements: partition → `TaskSnapshot` |
+| `{job}:ckpt:<id>:declines` | HASH | Declines: partition → reason |
+| `{job}:ckpt:<id>:meta` | STRING | `CheckpointMetadata` of a completed checkpoint |
+| `{job}:ckpt:latest` | STRING | Id of the latest completed checkpoint |
+| `{job}:blob:<name>` | STRING | State blobs written by state backends |
 
-Recovery is per partition. A crash in one key group never rolls back another, unlike Flink,
-where a failure restarts the affected pipelined region from the last global checkpoint.
+Stream entries carry `v` (payload), `ts` (event time), `p` (producer partition) and a kind
+field (record or barrier). `KeySpace` and `PartitionKeys` are the only classes that build key
+names.
 
-Restore cost in milestone 1 is a full `HGETALL` of the key group's state. Lazy loading with a
-bounded cache is a later optimization and does not change the protocol.
+## 12. Failure model and limits
 
-## 10. Time, watermarks and windows (planned, milestone 4)
+Exactly-once holds **as long as Redis does not lose acknowledged writes**:
 
-What exists today: sources assign event timestamps (`TimestampAssigner`, defaulting to the
-Redis entry time), compute `max timestamp - maxOutOfOrderness` as the watermark, and commit
-it with each batch. Timestamps travel with every shuffled record (`ts`).
-
-Plan:
-
-- Each producer periodically emits a **watermark entry** into each downstream input stream it
-  writes to. A keyed partition tracks the latest watermark per producer and uses the minimum,
-  as Flink does across input channels. Idle producers need an idleness timeout, or one quiet
-  source partition stalls every window.
-- Event-time timers live in the `:timers` ZSET, member = `[key][timestamp]`. When the
-  watermark advances, `commit.lua` pops due timers in the same transaction that commits the
-  batch, so a timer firing and its outputs are exactly-once too.
-- `window().reduce()` keeps one accumulator per (key, window) in keyed state and registers a
-  timer at `window.maxTimestamp()`. Records later than `allowedLateness` go to a side output.
-
-## 11. Backpressure
-
-Flink pushes records with credit-based flow control. Redstream pulls, like a Kafka consumer:
-each task reads its input at its own pace, so a slow partition never blocks a fast one. The
-risk moves to **unbounded input streams**: if a keyed stage falls behind, its `:in` streams
-grow in Redis memory.
-
-Planned: producers check the destination streams' length (`XLEN`) and pause forwarding above
-a threshold. Forwarding is already decoupled from processing by the outbox, so pausing it
-naturally slows upstream commits once the outbox grows past its own bound.
-
-Reads never use `XREAD BLOCK`, because all tasks in a worker share one multiplexed connection
-and a blocking read would stall every other task. Idle tasks sleep for `pollInterval`.
-
-## 12. Sinks and end-to-end guarantees
-
-Sinks are delivered through the same outbox and forwarder, so delivery into a sink stream is
-**at-least-once**: a crash between forwarding and acking re-appends entries. Every sink entry
-carries `(p, s)`, so a consumer that keeps the highest `s` per `p` gets exactly-once. The
-end-to-end test does exactly that and checks that, after dedup, there is one sink entry per
-input record.
-
-For a sink consumer that can't dedup, a later option is a sink that writes to a key in the
-producer's own slot (e.g. a per-partition result hash), which can be part of `commit.lua` and
-therefore exactly-once without dedup.
-
-## 13. Failure model and limits
-
-Exactly-once holds **as long as Redis does not lose acknowledged writes**. Know where that breaks:
-
-- **Async replication.** A primary can acknowledge a commit and fail before replicating it. The
-  promoted replica then has older state, older offsets and older outboxes, consistent with each
-  other per partition, but some outputs already forwarded downstream may correspond to commits
-  that no longer exist. `WAIT` reduces the window but does not close it.
-- **Persistence.** With `appendfsync everysec`, a crash of a single node can lose about one
-  second of commits, with the same effect. `appendfsync always` closes this at a large throughput cost.
-- **Memory.** State, input streams and outboxes all live in RAM. Streams are trimmed after
-  forwarding, but a stalled stage grows its inputs without bound until backpressure exists.
-- **Script size and latency.** A commit is one script call. Large batches block the shard for
-  their duration; `batchSize` trades throughput against tail latency for other clients of the shard.
+- **Async replication.** A primary can acknowledge a checkpoint commit and fail before
+  replicating it. The promoted replica may then lack the latest checkpoint, and the job
+  restores from an older one. State stays consistent; a two-phase-commit sink may have made
+  output visible for a checkpoint that is now lost.
+- **Persistence.** With `appendfsync everysec`, a single-node crash can lose about one second
+  of writes, with the same effect.
+- **Memory.** Data streams and checkpoint blobs live in Redis RAM. Streams must be trimmed once
+  a checkpoint no longer needs them, and old checkpoints discarded.
+- **Restart cost.** Global recovery replays everything since the last checkpoint, so the
+  checkpoint interval bounds the replay.
 - **Key group count is fixed** for the life of the job.
 
-Running on Valkey or Redis 7+ is assumed (scripts use `XTRIM MINID` and `TIME` before writes,
-which needs Redis 6.2+ with effects replication).
+Valkey or Redis 7+ is assumed.
 
-## 14. Comparison with Flink
+## 13. Comparison with Flink
 
 | Concern | Flink | Redstream |
 |---|---|---|
-| Control plane | JobManager schedules subtasks into TaskManager slots | No master; workers heartbeat and lease partitions in Redis |
-| Shipping the job | Serialize the JobGraph and user closures | Every worker runs the same `main()`; nothing is serialized |
+| Control plane | JobManager process | Leader lease held by one worker |
+| Shipping the job | Serialize the JobGraph and user closures | Every worker runs the same `main()` |
 | Unit of parallelism | Subtask; keyed state split into key groups | Partition: source stream or key group |
-| Operator chaining | Same-parallelism forward edges fused into one task | Everything between source/keyBy and the next keyBy/sink |
-| Shuffle transport | Netty network buffers with credit-based flow control | Outbox → forwarder → per-key-group Redis stream |
-| State backend | Heap or RocksDB, local to the TaskManager | Redis hash in the key group's slot |
-| Fault tolerance | Global barrier checkpoints (Chandy-Lamport style) | Per-batch atomic commit per partition, plus seq-number dedup |
-| Recovery scope | Restart region from last completed checkpoint | Just the failed partition, from its last commit |
-| Commit cost | Cheap per record; periodic async snapshots | One script call per batch, synchronous |
-| Exactly-once sink | Two-phase commit tied to checkpoint completion | Idempotent sink entries `(p, s)`; consumer dedups |
-| Zombie protection | Attempt ids; JobManager restarts tasks | Epoch fencing inside each commit script |
+| Operator chaining | Same-parallelism forward edges fused into one task | Everything between source or keyBy and the next keyBy or sink |
+| Shuffle transport | Netty with credit-based flow control | Per-key-group Redis streams |
+| State backend | Heap or RocksDB | Heap or RocksDB |
+| Checkpoint storage | JobManager memory, filesystem, S3 | Redis |
+| Fault tolerance | Aligned or unaligned barrier checkpoints | Aligned barrier checkpoints |
+| Recovery scope | Restart region from the last checkpoint | Whole job from the last checkpoint |
+| Exactly-once sink | Two-phase commit tied to checkpoint completion | Same |
+| Zombie protection | Attempt ids; JobManager restarts tasks | Lease epochs plus attempt ids |
 
-## 15. Milestones
+## 14. Open questions
 
-| # | Milestone | Status |
-|---|---|---|
-| 1 | Single stage: source → chained operators → sink, atomic commit, restore | Done |
-| 2 | keyBy shuffle with outbox, forwarder and (producer, seq) dedup | Done |
-| 3 | Leases, epochs, fencing, membership, assignment | Done |
-| 4 | Event time: watermark propagation, timers in `commit.lua`, windowed reduce | Planned |
-| 5 | Fault injection: crash points, worker kill and join, correctness checker | Done (`ExactlyOnceIT`); network partitions and Redis failover planned |
-| 6 | Backpressure on input stream length; lazy state loading | Planned |
-| 7 | Benchmarks: throughput and p99 vs batch size, vs a Flink baseline | Planned |
-| 8 | Rescaling `maxParallelism` with an offline state migration tool | Planned |
-
-## 16. Open questions
-
-- **Sticky assignment.** Round-robin by worker index moves many partitions when a worker joins.
-  Rendezvous hashing would move only about `1/n` of them.
-- **Batch size adaptation.** Larger batches mean fewer script calls but longer slot blocking.
-  Adapt to observed script latency?
-- **Watermarks with idle sources.** Which idleness rule, and should watermark entries piggyback
-  on data entries to save stream writes?
-- **Very hot keys.** One key group is one task; a hot key cannot be split. Local pre-aggregation
-  in the producer stage would help for associative reductions.
+- **Backpressure.** Tasks pull, so a slow keyed stage lets its input streams grow in Redis
+  memory. Pause sources when downstream streams pass a length limit?
+- **Sticky assignment.** Round-robin by worker index moves many partitions when a worker joins,
+  and each move costs a global restart. Rendezvous hashing would move about `1/n` of them.
+- **Restart storms.** Workers joining one after another each trigger a restart. Wait for
+  membership to settle before restarting?
+- **Event time.** Watermarks can travel through the same streams as barriers; which rule for
+  idle sources?
+- **Very hot keys.** One key group is one task; a hot key cannot be split.
